@@ -14,6 +14,7 @@ import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -33,11 +34,10 @@ abstract class UniComics : KeiSource() {
         rateLimit(3)
     }
 
-    override suspend fun getPopularManga(page: Int): MangasPage {
-        val document = client.get("$baseUrl/comics/series/page/$page").asJsoup()
-        val mangas = document.select(".comics-grid .comic-card").mapNotNull { element ->
-            popularMangaFromElement(element)
-        }
+    override suspend fun getPopularManga(page: Int): MangasPage = comicsGridPage(client.get("$baseUrl/comics/series/page/$page").asJsoup())
+
+    private fun comicsGridPage(document: Document): MangasPage {
+        val mangas = document.select(".comics-grid .comic-card").mapNotNull(::popularMangaFromElement)
         val hasNextPage = document.selectFirst("select.mobilePageSelector option[selected] ~ option") != null
         return MangasPage(mangas, hasNextPage)
     }
@@ -58,88 +58,91 @@ abstract class UniComics : KeiSource() {
         }
     }
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage {
-        val document = client.get("$baseUrl/comics/online/page/$page").asJsoup()
-        val mangas = document.select(".comics-grid .comic-card").mapNotNull { element ->
-            popularMangaFromElement(element)
-        }
-        val hasNextPage = document.selectFirst("select.mobilePageSelector option[selected] ~ option") != null
-        return MangasPage(mangas, hasNextPage)
-    }
+    override suspend fun getLatestUpdates(page: Int): MangasPage = comicsGridPage(client.get("$baseUrl/comics/online/page/$page").asJsoup())
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val events = filters.firstInstanceOrNull<GetEventsList>()
         val publisher = filters.firstInstanceOrNull<Publishers>()
 
-        val url = when {
-            query.isNotEmpty() -> HttpUrl.Builder()
-                .scheme("https")
-                .host("yandex.ru")
-                .addPathSegments("search/site/")
-                .addQueryParameter("searchid", "14915852")
-                .addQueryParameter("text", query)
-                .addQueryParameter("web", "0")
-                .addQueryParameter("l10n", "ru")
-                .addQueryParameter("p", (page - 1).toString())
-                .build().toString()
-
-            (events?.state ?: 0) > 0 -> "$baseUrl$PATH_EVENTS"
+        when {
+            query.isNotEmpty() -> return searchByMap(query, page)
+            (events?.state ?: 0) > 0 -> return getEvents(page)
             (publisher?.state ?: 0) > 0 -> {
                 val publisherName = publisher!!.urls[publisher.state]
-                "$baseUrl$PATH_PUBLISHERS/$publisherName/page/$page"
+                return comicsGridPage(client.get("$baseUrl$PATH_PUBLISHERS/$publisherName/page/$page").asJsoup())
             }
 
             else -> return getPopularManga(page)
         }
-
-        return searchMangaParse(client.get(url).asJsoup())
     }
 
-    private fun searchMangaParse(document: Document): MangasPage {
-        if (document.location().contains("yandex")) {
-            if (document.selectFirst(".CheckboxCaptcha, .captcha__captcha") != null) {
-                throw Exception("Пройдите капчу Yandex в WebView (слишком много запросов)")
+    // The site's own search is a client-side Yandex SiteSearch widget, so instead the
+    // /map page (which lists every series by RU and EN title) is matched client-side.
+    private suspend fun searchByMap(query: String, page: Int): MangasPage {
+        val queryTokens = QUERY_TOKEN_REGEX.findAll(query.lowercase()).map { it.value }.toList()
+        if (queryTokens.isEmpty()) return MangasPage(emptyList(), false)
+
+        val document = client.get("$baseUrl/map").asJsoup()
+
+        // Filter before dedup: /map lists every series twice (RU and EN titles sharing
+        // one slug), so a query matching only one variant must survive.
+        val filtered = document.select("a[href^=/comics/series/]").mapNotNull { a ->
+            val href = a.attr("href")
+            val title = a.text()
+            if (title.isEmpty()) return@mapNotNull null
+            val titleLower = title.lowercase()
+            val hrefLower = href.lowercase()
+            if (queryTokens.all { token -> titleLower.contains(token) || hrefLower.contains(token) }.not()) {
+                return@mapNotNull null
             }
+            SManga.create().apply {
+                setUrlWithoutDomain(href)
+                this.title = title
+            }
+        }.distinctBy { it.url }
 
-            val mangas = document.select(".b-serp-item__title-link").mapNotNull { a ->
-                val href = a.absUrl("href")
-                if (!href.contains("unicomics.ru")) return@mapNotNull null
+        val fromIndex = (page - 1) * SEARCH_PAGE_SIZE
+        if (fromIndex >= filtered.size) return MangasPage(emptyList(), false)
+        val toIndex = minOf(fromIndex + SEARCH_PAGE_SIZE, filtered.size)
+        val pageItems = filtered.subList(fromIndex, toIndex)
 
-                val urlString = href.replace("/comics/issue/", "/comics/series/")
-                    .replace("/comics/online/", "/comics/series/")
-                val seriesUrl = ISSUE_REGEX.replace(urlString, "")
-
-                SManga.create().apply {
-                    setUrlWithoutDomain(seriesUrl)
-                    title = a.text().substringBefore(" (").substringBefore(" №")
+        // /map carries no covers, so this page's covers are fetched from the series
+        // pages concurrently; a failed lookup just leaves that entry without a cover.
+        coroutineScope {
+            pageItems.map { manga ->
+                async {
+                    try {
+                        manga.thumbnail_url = client.get(baseUrl + manga.url).asJsoup()
+                            .selectFirst(".cover-series img, .cover-series-mobile img, .issue-cover img")
+                            ?.absUrl("src")
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                    }
                 }
+            }.awaitAll()
+        }
+
+        return MangasPage(pageItems, toIndex < filtered.size)
+    }
+
+    // The events grid is a single page on the site (no pagination).
+    private suspend fun getEvents(page: Int): MangasPage {
+        if (page > 1) return MangasPage(emptyList(), false)
+        val document = client.get("$baseUrl$PATH_EVENTS").asJsoup()
+        val mangas = document.select(".events-grid .event-card, .list_events").mapNotNull { element ->
+            val a = element.selectFirst("a") ?: return@mapNotNull null
+            val url = a.absUrl("href").takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            val title = element.selectFirst(".comic-title-ru, .event-title")?.text()?.takeIf { it.isNotEmpty() }
+                ?: a.text().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+
+            SManga.create().apply {
+                setUrlWithoutDomain(url)
+                this.title = title
+                thumbnail_url = element.selectFirst("img")?.absUrl("src")
             }
-            val hasNext = document.selectFirst(".b-pager__next") != null
-            return MangasPage(mangas.distinctBy { it.url }, hasNext)
         }
-
-        if (document.location().contains(PATH_EVENTS)) {
-            val mangas = document.select(".events-grid .event-card, .list_events").mapNotNull { element ->
-                val a = element.selectFirst("a") ?: return@mapNotNull null
-                val url = a.absUrl("href").takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-                val title = element.selectFirst(".comic-title-ru, .event-title")?.text()?.takeIf { it.isNotEmpty() }
-                    ?: a.text().takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-
-                SManga.create().apply {
-                    setUrlWithoutDomain(url)
-                    this.title = title
-                    thumbnail_url = element.selectFirst("img")?.absUrl("src")
-                }
-            }
-            return MangasPage(mangas, false)
-        }
-
-        val mangas = document.select(".comics-grid .comic-card").mapNotNull { element ->
-            popularMangaFromElement(element)
-        }
-        val hasNextPage = document.selectFirst("select.mobilePageSelector option[selected] ~ option") != null
-
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(mangas, false)
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
@@ -318,7 +321,8 @@ abstract class UniComics : KeiSource() {
         private const val PATH_PUBLISHERS = "/comics/publishers"
         private const val PATH_EVENTS = "/comics/events"
 
-        private val ISSUE_REGEX = "-\\d+/?$".toRegex()
+        private val QUERY_TOKEN_REGEX = "[\\p{L}\\p{N}]+".toRegex()
+        private const val SEARCH_PAGE_SIZE = 15
         private val CHAPTER_NUMBER_REGEX = "№\\s*(\\d+(?:\\.\\d+)?)".toRegex()
         private val PAGINATOR_REGEX = "new Paginator\\(['\"].*?['\"],\\s*(\\d+),\\s*\\d+,\\s*\\d+,\\s*['\"](.*?)['\"]\\)".toRegex()
     }
